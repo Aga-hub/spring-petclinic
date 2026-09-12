@@ -1,0 +1,199 @@
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout(true)
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    parameters {
+        string(
+            name: 'TARGET_BUILD',
+            defaultValue: '',
+            description: 'Numer builda CI, do którego cofnąć aplikację'
+        )
+    }
+
+    environment {
+        CI_JOB = 'spring-petclinic/main'
+
+        IMAGE_NAME = 'petclinic'
+        APP_CONTAINER = 'petclinic-prod-app'
+        DB_CONTAINER = 'petclinic-prod-db'
+
+        PROD_APP_HOST = '192.168.56.30'
+        PROD_DB_HOST = '192.168.56.40'
+
+        DB_NAME = 'petclinic'
+    }
+
+    stages {
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!(params.TARGET_BUILD ==~ /\d+/)) {
+                        error('TARGET_BUILD musi być numerem builda')
+                    }
+                }
+            }
+        }
+
+
+        stage('Retrieve Artifact') {
+            steps {
+                deleteDir()
+
+                copyArtifacts(
+                    projectName: env.CI_JOB,
+                    selector: specific("${params.TARGET_BUILD}"),
+                    filter: "petclinic-${params.TARGET_BUILD}.tar",
+                    fingerprintArtifacts: true
+                )
+            }
+        }
+
+
+        stage('Backup Database') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'prod-db-deploy-ssh',
+                        keyFileVariable: 'DB_KEY',
+                        usernameVariable: 'DB_SSH_USER'
+                    )
+                ]) {
+                    sh '''
+                        ssh -i "$DB_KEY" \
+                          "$DB_SSH_USER@$PROD_DB_HOST" \
+                          "docker exec ${DB_CONTAINER} \
+                           pg_dump -U petclinic \
+                           -d ${DB_NAME} \
+                           -Fc" \
+                          > "petclinic-before-rollback-${TARGET_BUILD}.dump"
+                    '''
+                }
+
+                archiveArtifacts(
+                    artifacts: 'petclinic-before-rollback-*.dump',
+                    fingerprint: true
+                )
+            }
+        }
+
+
+        stage('Transfer Artifact') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'prod-app-deploy-ssh',
+                        keyFileVariable: 'APP_KEY',
+                        usernameVariable: 'APP_USER'
+                    )
+                ]) {
+                    sh '''
+                        scp -i "$APP_KEY" \
+                          "petclinic-${TARGET_BUILD}.tar" \
+                          "$APP_USER@$PROD_APP_HOST:/tmp/"
+
+                        ssh -i "$APP_KEY" \
+                          "$APP_USER@$PROD_APP_HOST" \
+                          "docker load \
+                           -i /tmp/petclinic-${TARGET_BUILD}.tar &&
+                           rm -f /tmp/petclinic-${TARGET_BUILD}.tar"
+                    '''
+                }
+            }
+        }
+
+
+        stage('Rollback Application') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'prod-app-deploy-ssh',
+                        keyFileVariable: 'APP_KEY',
+                        usernameVariable: 'APP_USER'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'prod-postgres',
+                        usernameVariable: 'PG_USER',
+                        passwordVariable: 'PG_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+
+                        {
+                            echo "SPRING_PROFILES_ACTIVE=postgres"
+                            echo "POSTGRES_URL=jdbc:postgresql://${PROD_DB_HOST}:5432/${DB_NAME}"
+                            printf 'POSTGRES_USER=%s\\n' "$PG_USER"
+                            printf 'POSTGRES_PASS=%s\\n' "$PG_PASS"
+                        } | ssh -i "$APP_KEY" \
+                          "$APP_USER@$PROD_APP_HOST" \
+                          'umask 077; cat > /tmp/petclinic-prod.env'
+
+                        set -x
+
+                        ssh -i "$APP_KEY" \
+                          "$APP_USER@$PROD_APP_HOST" \
+                          "docker rm -f ${APP_CONTAINER} \
+                           >/dev/null 2>&1 || true;
+
+                           docker run -d \
+                           --name ${APP_CONTAINER} \
+                           --restart unless-stopped \
+                           -p 8080:8080 \
+                           --env-file /tmp/petclinic-prod.env \
+                           ${IMAGE_NAME}:${TARGET_BUILD};
+
+                           rm -f /tmp/petclinic-prod.env"
+                    '''
+                }
+            }
+        }
+
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    for i in $(seq 1 24); do
+                        if curl -fsS \
+                          --max-time 5 \
+                          http://${PROD_APP_HOST}:8080/ \
+                          >/dev/null; then
+
+                            echo "Rollback version healthy."
+                            exit 0
+                        fi
+
+                        sleep 5
+                    done
+
+                    exit 1
+                '''
+            }
+        }
+
+
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                    curl -fsSL \
+                      http://${PROD_APP_HOST}:8080/owners/find \
+                      >/dev/null
+
+                    curl -fsSL \
+                      http://${PROD_APP_HOST}:8080/vets.html \
+                      >/dev/null
+                '''
+            }
+        }
+    }
+
+    post {
+        cleanup {
+            deleteDir()
+        }
+    }
+}
