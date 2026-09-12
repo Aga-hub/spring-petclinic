@@ -4,22 +4,33 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         buildDiscarder(logRotator(numToKeepStr: '10'))
+
+        // Te joby mogą pobierać artefakty z CI.
+        copyArtifactPermission('deploy-production,rollback-production')
     }
 
     environment {
         MAVEN_OPTS = '-Xmx768m'
+
         IMAGE_NAME = 'petclinic'
+
         TEST_HOST = '192.168.56.20'
+        TEST_CONTAINER = 'petclinic-test-app'
+        TEST_DB_CONTAINER = 'petclinic-test-db'
+        TEST_NETWORK = 'petclinic-test-net'
     }
 
     stages {
 
         stage('Checkout') {
             steps {
+                // Usuwa stare .tar i inne pozostałości poprzednich buildów.
                 deleteDir()
+
                 checkout scm
             }
         }
+
 
         stage('Build and Test') {
             steps {
@@ -31,11 +42,14 @@ pipeline {
 
             post {
                 always {
-                    junit testResults: 'target/surefire-reports/*.xml',
-                          allowEmptyResults: true
+                    junit(
+                        testResults: 'target/surefire-reports/*.xml',
+                        allowEmptyResults: true
+                    )
                 }
             }
         }
+
 
         stage('Build Docker Image') {
             steps {
@@ -48,6 +62,7 @@ pipeline {
             }
         }
 
+
         stage('Create Artifact') {
             steps {
                 sh '''
@@ -58,6 +73,7 @@ pipeline {
             }
         }
 
+
         stage('Archive Artifact') {
             steps {
                 archiveArtifacts(
@@ -66,6 +82,7 @@ pipeline {
                 )
             }
         }
+
 
         stage('Deploy to TEST') {
             steps {
@@ -77,58 +94,110 @@ pipeline {
                     )
                 ]) {
                     sh '''
-                        mkdir -p ~/.ssh
-                        chmod 700 ~/.ssh
+                        scp \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$SSH_KEY" \
+                          "petclinic-${BUILD_NUMBER}.tar" \
+                          "$SSH_USER@$TEST_HOST:/tmp/"
 
-                        ssh-keyscan -H ${TEST_HOST} >> ~/.ssh/known_hosts
+                        ssh \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$SSH_KEY" \
+                          "$SSH_USER@$TEST_HOST" \
+                          "docker load \
+                           -i /tmp/petclinic-${BUILD_NUMBER}.tar &&
+                           rm -f /tmp/petclinic-${BUILD_NUMBER}.tar"
+                    '''
+                }
 
-                        scp -i "$SSH_KEY" \
-                          petclinic-${BUILD_NUMBER}.tar \
-                          ${SSH_USER}@${TEST_HOST}:/tmp/
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'test-deploy-ssh',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh '''
+                        ssh \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$SSH_KEY" \
+                          "$SSH_USER@$TEST_HOST" \
+                          "docker rm -f ${TEST_CONTAINER} \
+                           >/dev/null 2>&1 || true;
 
-                        ssh -i "$SSH_KEY" ${SSH_USER}@${TEST_HOST} "
-                          docker load -i /tmp/petclinic-${BUILD_NUMBER}.tar &&
-                          docker rm -f petclinic-test-app 2>/dev/null || true
-                        "
-
-                        ssh -i "$SSH_KEY" ${SSH_USER}@${TEST_HOST} "
-                          docker run -d \
-                            --name petclinic-test-app \
-                            --restart unless-stopped \
-                            --network petclinic-test-net \
-                            -p 8080:8080 \
-                            -e SPRING_PROFILES_ACTIVE=postgres \
-                            -e POSTGRES_URL=jdbc:postgresql://petclinic-test-db:5432/petclinic \
-                            -e POSTGRES_USER=petclinic \
-                            -e POSTGRES_PASS=petclinic-test \
-                            petclinic:${BUILD_NUMBER}
-                        "
-
-                        rm -f ~/.ssh/known_hosts
+                           docker run -d \
+                           --name ${TEST_CONTAINER} \
+                           --restart unless-stopped \
+                           --network ${TEST_NETWORK} \
+                           -p 8080:8080 \
+                           -e SPRING_PROFILES_ACTIVE=postgres \
+                           -e POSTGRES_URL=jdbc:postgresql://${TEST_DB_CONTAINER}:5432/petclinic \
+                           -e POSTGRES_USER=petclinic \
+                           -e POSTGRES_PASS=petclinic-test \
+                           ${IMAGE_NAME}:${BUILD_NUMBER}"
                     '''
                 }
             }
         }
 
+
         stage('TEST Health Check') {
             steps {
                 sh '''
-                    echo "Waiting for PetClinic to start..."
+                    echo "Waiting for TEST application..."
 
                     for i in $(seq 1 30); do
-                        if curl -fsS http://${TEST_HOST}:8080/ > /dev/null; then
-                            echo "PetClinic TEST environment is healthy"
+
+                        if curl -fsS \
+                          --max-time 5 \
+                          http://${TEST_HOST}:8080/ \
+                          >/dev/null; then
+
+                            echo "TEST environment is healthy."
                             exit 0
                         fi
 
-                        echo "Attempt $i/30 - application not ready yet"
+                        echo "Attempt $i/30"
                         sleep 5
                     done
 
-                    echo "Health check failed"
+                    echo "TEST health check failed."
                     exit 1
                 '''
             }
+        }
+
+
+        stage('TEST Smoke Test') {
+            steps {
+                sh '''
+                    curl -fsSL \
+                      --max-time 10 \
+                      http://${TEST_HOST}:8080/owners/find \
+                      >/dev/null
+
+                    curl -fsSL \
+                      --max-time 10 \
+                      http://${TEST_HOST}:8080/vets.html \
+                      >/dev/null
+                '''
+            }
+        }
+    }
+
+
+    post {
+
+        success {
+            echo 'CI/TEST pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'CI/TEST pipeline failed.'
+        }
+
+        cleanup {
+            deleteDir()
         }
     }
 }
