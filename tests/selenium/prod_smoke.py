@@ -5,11 +5,12 @@ from selenium.webdriver.support import expected_conditions as EC
 
 PROD_URL = "http://192.168.56.30:8080"
 
-options.add_argument("--window-size=1920,1080")
 options = webdriver.ChromeOptions()
 options.add_argument("--headless=new")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--window-size=1920,1080")
+
 
 driver = webdriver.Chrome(options=options)
 
