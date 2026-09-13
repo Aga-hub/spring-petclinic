@@ -796,10 +796,10 @@ EOF
                                  ${previousImage}
 
                                rm -f /tmp/petclinic-prod.env"
-                        """
+                        '''
                     }
 
-                    sh """
+                    sh '''
                         echo "Checking rolled-back application..."
 
                         for i in $(seq 1 12)
