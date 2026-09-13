@@ -764,7 +764,7 @@ EOF
                         )
                     ]) {
 
-                        sh '''
+                        sh """
                             set +x
 
                             cat > /tmp/petclinic-prod.env <<EOF
@@ -796,7 +796,7 @@ EOF
                                  ${previousImage}
 
                                rm -f /tmp/petclinic-prod.env"
-                        '''
+                        """
                     }
 
                     sh '''
