@@ -1,4 +1,7 @@
+def rollbackRequired = false
+
 pipeline {
+
     agent {
         label 'default-agent'
     }
@@ -6,20 +9,20 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
     }
 
     parameters {
-
         string(
             name: 'SOURCE_BUILD',
             defaultValue: '',
-            description: 'Numer udanego builda CI/TEST do wdrożenia'
+            description: 'Numer udanego builda CI, który ma zostać wdrożony'
         )
 
         booleanParam(
             name: 'RUN_DB_MIGRATION',
             defaultValue: false,
-            description: 'Wykonaj załączoną migrację SQL przed deploymentem'
+            description: 'Uruchomić migrację bazy danych przed deploymentem'
         )
 
         base64File 'MIGRATION_SQL'
@@ -28,36 +31,43 @@ pipeline {
     environment {
         CI_JOB = 'spring-petclinic/main'
 
-        IMAGE_NAME = 'petclinic'
-        APP_CONTAINER = 'petclinic-prod-app'
-        DB_CONTAINER = 'petclinic-prod-db'
-
         PROD_APP_HOST = '192.168.56.30'
-        PROD_DB_HOST = '192.168.56.40'
+        PROD_DB_HOST  = '192.168.56.40'
+
+        APP_CONTAINER = 'petclinic-prod-app'
+        DB_CONTAINER  = 'petclinic-prod-db'
 
         DB_NAME = 'petclinic'
-
-        ROLLBACK_REQUIRED = 'false'
     }
 
     stages {
 
+        // =========================================================
+        // 1. VALIDATION
+        // =========================================================
         stage('Validate Parameters') {
             steps {
                 script {
+                    if (!params.SOURCE_BUILD?.trim()) {
+                        error('SOURCE_BUILD nie może być pusty.')
+                    }
 
-                    if (!(params.SOURCE_BUILD ==~ /\d+/)) {
+                    if (!(params.SOURCE_BUILD ==~ /^[0-9]+$/)) {
                         error('SOURCE_BUILD musi być numerem builda CI.')
                     }
+
+                    echo "Selected CI build: ${params.SOURCE_BUILD}"
+                    echo "Run DB migration: ${params.RUN_DB_MIGRATION}"
                 }
             }
         }
 
 
+        // =========================================================
+        // 2. RETRIEVE EXACT CI ARTIFACT
+        // =========================================================
         stage('Retrieve Artifact') {
             steps {
-                deleteDir()
-
                 copyArtifacts(
                     projectName: env.CI_JOB,
                     selector: specific("${params.SOURCE_BUILD}"),
@@ -67,86 +77,110 @@ pipeline {
 
                 sh '''
                     test -f "petclinic-${SOURCE_BUILD}.tar"
+                    ls -lh "petclinic-${SOURCE_BUILD}.tar"
                 '''
             }
         }
 
 
+        // =========================================================
+        // 3. PRE-DEPLOYMENT CHECKS
+        // =========================================================
         stage('Pre-deployment Checks') {
             steps {
-                withCredentials([
+                script {
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: 'prod-app-deploy-ssh',
+                            keyFileVariable: 'APP_SSH_KEY',
+                            usernameVariable: 'APP_SSH_USER'
+                        ),
+                        sshUserPrivateKey(
+                            credentialsId: 'prod-db-deploy-ssh',
+                            keyFileVariable: 'DB_SSH_KEY',
+                            usernameVariable: 'DB_SSH_USER'
+                        )
+                    ]) {
 
-                    sshUserPrivateKey(
-                        credentialsId: 'prod-app-deploy-ssh',
-                        keyFileVariable: 'APP_KEY',
-                        usernameVariable: 'APP_USER'
-                    ),
+                        sh '''
+                            set -e
 
-                    sshUserPrivateKey(
-                        credentialsId: 'prod-db-deploy-ssh',
-                        keyFileVariable: 'DB_KEY',
-                        usernameVariable: 'DB_SSH_USER'
-                    )
+                            echo "Checking prod-app..."
+                            ssh \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "$APP_SSH_KEY" \
+                              "$APP_SSH_USER@$PROD_APP_HOST" \
+                              "docker info >/dev/null"
 
-                ]) {
-                    sh '''
-                        ssh \
-                          -o StrictHostKeyChecking=accept-new \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
-                          "docker info >/dev/null"
+                            echo "Checking prod-db..."
+                            ssh \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "$DB_SSH_KEY" \
+                              "$DB_SSH_USER@$PROD_DB_HOST" \
+                              "docker exec $DB_CONTAINER pg_isready -U petclinic -d $DB_NAME"
 
-                        ssh \
-                          -o StrictHostKeyChecking=accept-new \
-                          -i "$DB_KEY" \
-                          "$DB_SSH_USER@$PROD_DB_HOST" \
-                          "docker exec ${DB_CONTAINER} \
-                           pg_isready \
-                           -U petclinic \
-                           -d ${DB_NAME}"
-                    '''
+                            echo "Checking disk space..."
+                            ssh \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "$APP_SSH_KEY" \
+                              "$APP_SSH_USER@$PROD_APP_HOST" \
+                              "df -h /"
+                        '''
+                    }
                 }
             }
         }
 
 
+        // =========================================================
+        // 4. DATABASE BACKUP
+        // =========================================================
         stage('Backup Database') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
                         credentialsId: 'prod-db-deploy-ssh',
-                        keyFileVariable: 'DB_KEY',
+                        keyFileVariable: 'DB_SSH_KEY',
                         usernameVariable: 'DB_SSH_USER'
                     )
                 ]) {
-                    sh '''
-                        ssh \
-                          -i "$DB_KEY" \
-                          "$DB_SSH_USER@$PROD_DB_HOST" \
-                          "docker exec ${DB_CONTAINER} \
-                           pg_dump \
-                           -U petclinic \
-                           -d ${DB_NAME} \
-                           -Fc" \
-                          > "petclinic-before-build-${SOURCE_BUILD}.dump"
 
-                        test -s \
-                          "petclinic-before-build-${SOURCE_BUILD}.dump"
+                    sh '''
+                        set -e
+
+                        BACKUP_FILE="petclinic-before-build-${SOURCE_BUILD}.dump"
+
+                        echo "Creating database backup..."
+
+                        ssh \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$DB_SSH_KEY" \
+                          "$DB_SSH_USER@$PROD_DB_HOST" \
+                          "docker exec $DB_CONTAINER pg_dump -U petclinic -d $DB_NAME -Fc" \
+                          > "$BACKUP_FILE"
+
+                        test -s "$BACKUP_FILE"
+
+                        ls -lh "$BACKUP_FILE"
                     '''
                 }
 
                 archiveArtifacts(
-                    artifacts: 'petclinic-before-build-*.dump',
+                    artifacts: "petclinic-before-build-${params.SOURCE_BUILD}.dump",
                     fingerprint: true
                 )
             }
         }
 
 
+        // =========================================================
+        // 5. OPTIONAL DATABASE MIGRATION
+        // =========================================================
         stage('Database Migration') {
+
             when {
                 expression {
-                    params.RUN_DB_MIGRATION
+                    return params.RUN_DB_MIGRATION
                 }
             }
 
@@ -154,43 +188,47 @@ pipeline {
                 withFileParameter('MIGRATION_SQL') {
 
                     sh '''
-                        cp "$MIGRATION_SQL" \
+                        set -e
+
+                        cp "$MIGRATION_SQL" "migration-${SOURCE_BUILD}.sql"
+
+                        echo "Checking migration script..."
+
+                        if grep -Eqi \
+                          'DROP[[:space:]]+TABLE|DROP[[:space:]]+COLUMN|TRUNCATE' \
                           "migration-${SOURCE_BUILD}.sql"
-
-                        echo "Migration file:"
-                        echo "${MIGRATION_SQL_FILENAME:-uploaded.sql}"
-
-                        # Automatyczny pipeline nie dopuszcza
-                        # podstawowych operacji destrukcyjnych.
-                        if grep -Eiq \
-                          'DROP[[:space:]]+(TABLE|COLUMN)|TRUNCATE[[:space:]]' \
-                          "migration-${SOURCE_BUILD}.sql"; then
-
-                            echo "Destructive migration rejected."
+                        then
+                            echo "Destructive SQL detected."
                             exit 1
                         fi
                     '''
 
                     archiveArtifacts(
-                        artifacts: 'migration-*.sql',
+                        artifacts: "migration-${params.SOURCE_BUILD}.sql",
                         fingerprint: true
                     )
 
                     withCredentials([
                         sshUserPrivateKey(
                             credentialsId: 'prod-db-deploy-ssh',
-                            keyFileVariable: 'DB_KEY',
+                            keyFileVariable: 'DB_SSH_KEY',
                             usernameVariable: 'DB_SSH_USER'
                         )
                     ]) {
+
                         sh '''
+                            set -e
+
+                            echo "Executing database migration..."
+
                             ssh \
-                              -i "$DB_KEY" \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "$DB_SSH_KEY" \
                               "$DB_SSH_USER@$PROD_DB_HOST" \
-                              "docker exec -i ${DB_CONTAINER} \
+                              "docker exec -i $DB_CONTAINER \
                                psql \
                                -U petclinic \
-                               -d ${DB_NAME} \
+                               -d $DB_NAME \
                                -v ON_ERROR_STOP=1 \
                                --single-transaction" \
                               < "migration-${SOURCE_BUILD}.sql"
@@ -201,142 +239,147 @@ pipeline {
         }
 
 
+        // =========================================================
+        // 6. REMEMBER CURRENT VERSION
+        // =========================================================
         stage('Capture Current Version') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
                         credentialsId: 'prod-app-deploy-ssh',
-                        keyFileVariable: 'APP_KEY',
-                        usernameVariable: 'APP_USER'
+                        keyFileVariable: 'APP_SSH_KEY',
+                        usernameVariable: 'APP_SSH_USER'
                     )
                 ]) {
+
                     sh '''
-                        ssh \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
+                        PREVIOUS_IMAGE=$(ssh \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$APP_SSH_KEY" \
+                          "$APP_SSH_USER@$PROD_APP_HOST" \
                           "docker inspect \
                            -f '{{.Config.Image}}' \
-                           ${APP_CONTAINER} \
-                           2>/dev/null || true" \
-                          > previous-image.txt
+                           $APP_CONTAINER 2>/dev/null || true")
 
-                        echo "Previous image:"
+                        printf '%s' "$PREVIOUS_IMAGE" > previous-image.txt
+
+                        echo "Previous production image:"
                         cat previous-image.txt
+                        echo
                     '''
                 }
+
+                archiveArtifacts(
+                    artifacts: 'previous-image.txt',
+                    allowEmptyArchive: true
+                )
             }
         }
 
 
+        // =========================================================
+        // 7. TRANSFER ARTIFACT
+        // =========================================================
         stage('Transfer Artifact') {
             steps {
                 withCredentials([
                     sshUserPrivateKey(
                         credentialsId: 'prod-app-deploy-ssh',
-                        keyFileVariable: 'APP_KEY',
-                        usernameVariable: 'APP_USER'
+                        keyFileVariable: 'APP_SSH_KEY',
+                        usernameVariable: 'APP_SSH_USER'
                     )
                 ]) {
+
                     sh '''
+                        set -e
+
                         scp \
-                          -i "$APP_KEY" \
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$APP_SSH_KEY" \
                           "petclinic-${SOURCE_BUILD}.tar" \
-                          "$APP_USER@$PROD_APP_HOST:/tmp/"
+                          "$APP_SSH_USER@$PROD_APP_HOST:/tmp/petclinic-${SOURCE_BUILD}.tar"
 
                         ssh \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
-                          "docker load \
-                           -i /tmp/petclinic-${SOURCE_BUILD}.tar &&
-                           rm -f \
-                           /tmp/petclinic-${SOURCE_BUILD}.tar"
+                          -o StrictHostKeyChecking=accept-new \
+                          -i "$APP_SSH_KEY" \
+                          "$APP_SSH_USER@$PROD_APP_HOST" \
+                          "docker load < /tmp/petclinic-${SOURCE_BUILD}.tar \
+                           && rm -f /tmp/petclinic-${SOURCE_BUILD}.tar"
                     '''
                 }
             }
         }
 
 
+        // =========================================================
+        // 8. DEPLOY APPLICATION
+        // =========================================================
         stage('Deploy Application') {
             steps {
                 script {
 
-                    int result = 0
+                    int deployStatus
 
                     withCredentials([
-
                         sshUserPrivateKey(
                             credentialsId: 'prod-app-deploy-ssh',
-                            keyFileVariable: 'APP_KEY',
-                            usernameVariable: 'APP_USER'
+                            keyFileVariable: 'APP_SSH_KEY',
+                            usernameVariable: 'APP_SSH_USER'
                         ),
-
                         usernamePassword(
                             credentialsId: 'prod-postgres',
-                            usernameVariable: 'PG_USER',
-                            passwordVariable: 'PG_PASS'
+                            usernameVariable: 'DB_USER',
+                            passwordVariable: 'DB_PASS'
                         )
-
                     ]) {
 
-                        result = sh(
+                        deployStatus = sh(
                             returnStatus: true,
                             script: '''
                                 set +x
 
-                                {
-                                    echo "SPRING_PROFILES_ACTIVE=postgres"
+                                cat > /tmp/petclinic-prod.env <<EOF
+SPRING_PROFILES_ACTIVE=postgres
+POSTGRES_URL=jdbc:postgresql://${PROD_DB_HOST}:5432/${DB_NAME}
+POSTGRES_USER=${DB_USER}
+POSTGRES_PASS=${DB_PASS}
+EOF
 
-                                    echo "POSTGRES_URL=jdbc:postgresql://${PROD_DB_HOST}:5432/${DB_NAME}"
+                                scp \
+                                  -o StrictHostKeyChecking=accept-new \
+                                  -i "$APP_SSH_KEY" \
+                                  /tmp/petclinic-prod.env \
+                                  "$APP_SSH_USER@$PROD_APP_HOST:/tmp/petclinic-prod.env"
 
-                                    printf \
-                                      'POSTGRES_USER=%s\\n' \
-                                      "$PG_USER"
-
-                                    printf \
-                                      'POSTGRES_PASS=%s\\n' \
-                                      "$PG_PASS"
-
-                                } | ssh \
-                                  -i "$APP_KEY" \
-                                  "$APP_USER@$PROD_APP_HOST" \
-                                  'umask 077; cat > /tmp/petclinic-prod.env'
-
-                                set -x
+                                rm -f /tmp/petclinic-prod.env
 
                                 ssh \
-                                  -i "$APP_KEY" \
-                                  "$APP_USER@$PROD_APP_HOST" \
-                                  "docker rm -f ${APP_CONTAINER} \
-                                   >/dev/null 2>&1 || true;
+                                  -o StrictHostKeyChecking=accept-new \
+                                  -i "$APP_SSH_KEY" \
+                                  "$APP_SSH_USER@$PROD_APP_HOST" \
+                                  "docker rm -f $APP_CONTAINER >/dev/null 2>&1 || true
 
                                    docker run -d \
-                                   --name ${APP_CONTAINER} \
-                                   --restart unless-stopped \
-                                   -p 8080:8080 \
-                                   --env-file /tmp/petclinic-prod.env \
-                                   ${IMAGE_NAME}:${SOURCE_BUILD}"
+                                     --name $APP_CONTAINER \
+                                     --restart unless-stopped \
+                                     -p 8080:8080 \
+                                     --env-file /tmp/petclinic-prod.env \
+                                     petclinic:${SOURCE_BUILD}
 
-                                RESULT=$?
-
-                                ssh \
-                                  -i "$APP_KEY" \
-                                  "$APP_USER@$PROD_APP_HOST" \
-                                  "rm -f /tmp/petclinic-prod.env"
-
-                                exit $RESULT
+                                   rm -f /tmp/petclinic-prod.env"
                             '''
                         )
                     }
 
-                    if (result != 0) {
+                    if (deployStatus != 0) {
 
-                        env.ROLLBACK_REQUIRED = 'true'
+                        rollbackRequired = true
 
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error('Production deployment failed.')
+                            error('Application deployment failed.')
                         }
                     }
                 }
@@ -344,52 +387,57 @@ pipeline {
         }
 
 
+        // =========================================================
+        // 9. CONTAINER STATUS
+        // =========================================================
         stage('Container Status Check') {
+
             when {
                 expression {
-                    env.ROLLBACK_REQUIRED != 'true'
+                    return !rollbackRequired
                 }
             }
 
             steps {
                 script {
 
-                    int result = 0
+                    int containerStatus
 
                     withCredentials([
                         sshUserPrivateKey(
                             credentialsId: 'prod-app-deploy-ssh',
-                            keyFileVariable: 'APP_KEY',
-                            usernameVariable: 'APP_USER'
+                            keyFileVariable: 'APP_SSH_KEY',
+                            usernameVariable: 'APP_SSH_USER'
                         )
                     ]) {
 
-                        result = sh(
+                        containerStatus = sh(
                             returnStatus: true,
                             script: '''
                                 STATUS=$(ssh \
-                                  -i "$APP_KEY" \
-                                  "$APP_USER@$PROD_APP_HOST" \
+                                  -o StrictHostKeyChecking=accept-new \
+                                  -i "$APP_SSH_KEY" \
+                                  "$APP_SSH_USER@$PROD_APP_HOST" \
                                   "docker inspect \
                                    -f '{{.State.Running}}' \
-                                   ${APP_CONTAINER}")
+                                   $APP_CONTAINER 2>/dev/null")
+
+                                echo "Container running: $STATUS"
 
                                 test "$STATUS" = "true"
                             '''
                         )
                     }
 
-                    if (result != 0) {
+                    if (containerStatus != 0) {
 
-                        env.ROLLBACK_REQUIRED = 'true'
+                        rollbackRequired = true
 
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error(
-                                'Production container is not running.'
-                            )
+                            error('Production container is not running.')
                         }
                     }
                 }
@@ -397,29 +445,38 @@ pipeline {
         }
 
 
+        // =========================================================
+        // 10. HEALTH CHECK
+        // =========================================================
         stage('Health Check') {
+
             when {
                 expression {
-                    env.ROLLBACK_REQUIRED != 'true'
+                    return !rollbackRequired
                 }
             }
 
             steps {
                 script {
 
-                    int result = sh(
+                    int healthStatus = sh(
                         returnStatus: true,
                         script: '''
-                            for i in $(seq 1 24); do
+                            echo "Waiting for application..."
 
-                                if curl -fsS \
+                            for i in $(seq 1 12)
+                            do
+                                if curl \
+                                  -fsS \
                                   --max-time 5 \
-                                  http://${PROD_APP_HOST}:8080/ \
-                                  >/dev/null; then
-
+                                  "http://${PROD_APP_HOST}:8080/" \
+                                  >/dev/null
+                                then
+                                    echo "Health check passed."
                                     exit 0
                                 fi
 
+                                echo "Attempt $i/12 failed."
                                 sleep 5
                             done
 
@@ -427,17 +484,15 @@ pipeline {
                         '''
                     )
 
-                    if (result != 0) {
+                    if (healthStatus != 0) {
 
-                        env.ROLLBACK_REQUIRED = 'true'
+                        rollbackRequired = true
 
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error(
-                                'Production health check failed.'
-                            )
+                            error('Production health check failed.')
                         }
                     }
                 }
@@ -445,42 +500,48 @@ pipeline {
         }
 
 
+        // =========================================================
+        // 11. HTTP SMOKE TEST
+        // =========================================================
         stage('Smoke Test') {
+
             when {
                 expression {
-                    env.ROLLBACK_REQUIRED != 'true'
+                    return !rollbackRequired
                 }
             }
 
             steps {
                 script {
 
-                    int result = sh(
+                    int smokeStatus = sh(
                         returnStatus: true,
                         script: '''
-                            curl -fsSL \
+                            set -e
+
+                            curl \
+                              -fsS \
                               --max-time 10 \
-                              http://${PROD_APP_HOST}:8080/owners/find \
+                              "http://${PROD_APP_HOST}:8080/owners/find" \
                               >/dev/null
 
-                            curl -fsSL \
+                            curl \
+                              -fsS \
                               --max-time 10 \
-                              http://${PROD_APP_HOST}:8080/vets.html \
+                              "http://${PROD_APP_HOST}:8080/vets.html" \
                               >/dev/null
                         '''
                     )
 
-                    if (result != 0) {
+                    if (smokeStatus != 0) {
 
-                        env.ROLLBACK_REQUIRED = 'true'
+                        rollbackRequired = true
 
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error(
-                                'Production smoke test failed.'
-                            )
+                            error('Production smoke test failed.')
                         }
                     }
                 }
@@ -488,151 +549,170 @@ pipeline {
         }
 
 
+        // =========================================================
+        // 12. INITIAL LOG ANALYSIS
+        // =========================================================
         stage('Initial Log Analysis') {
+
             when {
                 expression {
-                    env.ROLLBACK_REQUIRED != 'true'
+                    return !rollbackRequired
                 }
             }
 
             steps {
-
-                withCredentials([
-                    sshUserPrivateKey(
-                        credentialsId: 'prod-app-deploy-ssh',
-                        keyFileVariable: 'APP_KEY',
-                        usernameVariable: 'APP_USER'
-                    )
-                ]) {
-                    sh '''
-                        ssh \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
-                          "docker logs \
-                           --since 2m \
-                           ${APP_CONTAINER} 2>&1" \
-                          > prod-initial.log
-                    '''
-                }
-
                 script {
 
-                    int critical = sh(
-                        returnStatus: true,
-                        script: '''
-                            grep -Eiq \
-                              '(^|[[:space:]])(ERROR|FATAL)([[:space:]:]|$)' \
-                              prod-initial.log
-                        '''
-                    )
-
-                    if (critical == 0) {
-
-                        env.ROLLBACK_REQUIRED = 'true'
-
-                        catchError(
-                            buildResult: 'SUCCESS',
-                            stageResult: 'FAILURE'
-                        ) {
-                            error(
-                                'Critical error detected in logs.'
-                            )
-                        }
-                    }
-
-                    else {
-
-                        int warning = sh(
-                            returnStatus: true,
-                            script: '''
-                                grep -Eiq \
-                                  '(^|[[:space:]])WARN([[:space:]:]|$)' \
-                                  prod-initial.log
-                            '''
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: 'prod-app-deploy-ssh',
+                            keyFileVariable: 'APP_SSH_KEY',
+                            usernameVariable: 'APP_SSH_USER'
                         )
+                    ]) {
 
-                        if (warning == 0) {
-                            unstable(
-                                'Warnings detected in production logs.'
-                            )
-                        }
+                        sh '''
+                            ssh \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "$APP_SSH_KEY" \
+                              "$APP_SSH_USER@$PROD_APP_HOST" \
+                              "docker logs --tail 200 $APP_CONTAINER 2>&1" \
+                              > prod-initial.log
+                        '''
                     }
-                }
-            }
 
-            post {
-                always {
                     archiveArtifacts(
                         artifacts: 'prod-initial.log',
                         allowEmptyArchive: true
                     )
-                }
-            }
-        }
 
-
-        stage('Post-deployment Verification') {
-            when {
-                expression {
-                    env.ROLLBACK_REQUIRED != 'true'
-                }
-            }
-
-            steps {
-
-                sleep(
-                    time: 20,
-                    unit: 'SECONDS'
-                )
-
-                script {
-
-                    int result = sh(
+                    int criticalLogs = sh(
                         returnStatus: true,
                         script: '''
-                            curl -fsS \
-                              --max-time 5 \
-                              http://${PROD_APP_HOST}:8080/ \
-                              >/dev/null
+                            grep -Eqi 'ERROR|FATAL' prod-initial.log
                         '''
                     )
 
-                    if (result != 0) {
+                    /*
+                     * grep:
+                     * 0 = pattern found
+                     * 1 = pattern not found
+                     */
 
-                        env.ROLLBACK_REQUIRED = 'true'
+                    if (criticalLogs == 0) {
+
+                        rollbackRequired = true
 
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error(
-                                'Post-deployment verification failed.'
-                            )
+                            error('Critical errors detected in application logs.')
+                        }
+
+                    } else {
+
+                        int warningLogs = sh(
+                            returnStatus: true,
+                            script: '''
+                                grep -Eqi 'WARN' prod-initial.log
+                            '''
+                        )
+
+                        if (warningLogs == 0) {
+                            unstable('Warnings detected in initial production logs.')
                         }
                     }
                 }
             }
         }
 
+
+        // =========================================================
+        // 13. STABILIZATION / SECOND CHECK
+        // =========================================================
+        stage('Post-deployment Verification') {
+
+            when {
+                expression {
+                    return !rollbackRequired
+                }
+            }
+
+            steps {
+                script {
+
+                    int verificationStatus = sh(
+                        returnStatus: true,
+                        script: '''
+                            echo "Waiting for stabilization..."
+                            sleep 20
+
+                            curl \
+                              -fsS \
+                              --max-time 10 \
+                              "http://${PROD_APP_HOST}:8080/" \
+                              >/dev/null
+                        '''
+                    )
+
+                    if (verificationStatus != 0) {
+
+                        rollbackRequired = true
+
+                        catchError(
+                            buildResult: 'SUCCESS',
+                            stageResult: 'FAILURE'
+                        ) {
+                            error('Post-deployment verification failed.')
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // =========================================================
+        // 14. SELENIUM E2E
+        // =========================================================
         stage('Selenium E2E Test') {
+
+            when {
+                expression {
+                    return !rollbackRequired
+                }
+            }
+
             agent {
                 label 'selenium-agent'
             }
-        
+
             steps {
+
                 checkout scm
-        
+
                 script {
+
                     int seleniumStatus = sh(
+                        returnStatus: true,
                         script: '''
                             python tests/selenium/prod_smoke.py
-                        ''',
-                        returnStatus: true
+                        '''
                     )
-        
+
+                    /*
+                     * prod_smoke.py zapisuje te pliki tylko w razie
+                     * niepowodzenia testu.
+                     */
+                    archiveArtifacts(
+                        artifacts: 'selenium-failure.png,selenium-page.html',
+                        allowEmptyArchive: true
+                    )
+
                     if (seleniumStatus != 0) {
-                        env.ROLLBACK_REQUIRED = 'true'
-        
+
+                        rollbackRequired = true
+
                         catchError(
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
@@ -644,119 +724,125 @@ pipeline {
             }
         }
 
+
+        // =========================================================
+        // 15. AUTOMATIC APPLICATION ROLLBACK
+        // =========================================================
         stage('Automatic Application Rollback') {
+
             when {
                 expression {
-                    env.ROLLBACK_REQUIRED == 'true'
+                    return rollbackRequired
                 }
             }
 
             steps {
+                script {
 
-                withCredentials([
+                    String previousImage = readFile(
+                        'previous-image.txt'
+                    ).trim()
 
-                    sshUserPrivateKey(
-                        credentialsId: 'prod-app-deploy-ssh',
-                        keyFileVariable: 'APP_KEY',
-                        usernameVariable: 'APP_USER'
-                    ),
+                    if (!previousImage) {
+                        error(
+                            'Rollback required, but no previous production image exists.'
+                        )
+                    }
 
-                    usernamePassword(
-                        credentialsId: 'prod-postgres',
-                        usernameVariable: 'PG_USER',
-                        passwordVariable: 'PG_PASS'
-                    )
+                    echo "Rolling back application to: ${previousImage}"
 
-                ]) {
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: 'prod-app-deploy-ssh',
+                            keyFileVariable: 'APP_SSH_KEY',
+                            usernameVariable: 'APP_SSH_USER'
+                        ),
+                        usernamePassword(
+                            credentialsId: 'prod-postgres',
+                            usernameVariable: 'DB_USER',
+                            passwordVariable: 'DB_PASS'
+                        )
+                    ]) {
 
-                    sh '''
-                        PREVIOUS_IMAGE=$(tr -d '\\r\\n' \
-                          < previous-image.txt)
+                        sh """
+                            set +x
 
-                        if [ -z "$PREVIOUS_IMAGE" ]; then
+                            cat > /tmp/petclinic-prod.env <<EOF
+SPRING_PROFILES_ACTIVE=postgres
+POSTGRES_URL=jdbc:postgresql://${env.PROD_DB_HOST}:5432/${env.DB_NAME}
+POSTGRES_USER=\${DB_USER}
+POSTGRES_PASS=\${DB_PASS}
+EOF
 
-                            echo "No previous image available."
+                            scp \
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "\$APP_SSH_KEY" \
+                              /tmp/petclinic-prod.env \
+                              "\$APP_SSH_USER@${env.PROD_APP_HOST}:/tmp/petclinic-prod.env"
+
+                            rm -f /tmp/petclinic-prod.env
 
                             ssh \
-                              -i "$APP_KEY" \
-                              "$APP_USER@$PROD_APP_HOST" \
-                              "docker rm -f ${APP_CONTAINER} \
-                               >/dev/null 2>&1 || true"
+                              -o StrictHostKeyChecking=accept-new \
+                              -i "\$APP_SSH_KEY" \
+                              "\$APP_SSH_USER@${env.PROD_APP_HOST}" \
+                              "docker rm -f ${env.APP_CONTAINER} >/dev/null 2>&1 || true
 
-                            exit 1
-                        fi
+                               docker run -d \
+                                 --name ${env.APP_CONTAINER} \
+                                 --restart unless-stopped \
+                                 -p 8080:8080 \
+                                 --env-file /tmp/petclinic-prod.env \
+                                 ${previousImage}
 
-                        echo "Rolling back application to:"
-                        echo "$PREVIOUS_IMAGE"
+                               rm -f /tmp/petclinic-prod.env"
+                        """
+                    }
 
-                        set +x
+                    sh """
+                        echo "Checking rolled-back application..."
 
-                        {
-                            echo "SPRING_PROFILES_ACTIVE=postgres"
-
-                            echo "POSTGRES_URL=jdbc:postgresql://${PROD_DB_HOST}:5432/${DB_NAME}"
-
-                            printf \
-                              'POSTGRES_USER=%s\\n' \
-                              "$PG_USER"
-
-                            printf \
-                              'POSTGRES_PASS=%s\\n' \
-                              "$PG_PASS"
-
-                        } | ssh \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
-                          'umask 077; cat > /tmp/petclinic-prod.env'
-
-                        set -x
-
-                        ssh \
-                          -i "$APP_KEY" \
-                          "$APP_USER@$PROD_APP_HOST" \
-                          "docker rm -f ${APP_CONTAINER} \
-                           >/dev/null 2>&1 || true;
-
-                           docker run -d \
-                           --name ${APP_CONTAINER} \
-                           --restart unless-stopped \
-                           -p 8080:8080 \
-                           --env-file /tmp/petclinic-prod.env \
-                           ${PREVIOUS_IMAGE};
-
-                           rm -f /tmp/petclinic-prod.env"
-
-                        echo "Waiting for rollback version..."
-
-                        for i in $(seq 1 24); do
-
-                            if curl -fsS \
+                        for i in $(seq 1 12)
+                        do
+                            if curl \
+                              -fsS \
                               --max-time 5 \
-                              http://${PROD_APP_HOST}:8080/ \
-                              >/dev/null; then
-
-                                echo "Rollback successful."
+                              "http://${PROD_APP_HOST}:8080/" \
+                              >/dev/null
+                            then
+                                echo "Rollback health check passed."
                                 exit 0
                             fi
 
+                            echo "Rollback health attempt $i/12 failed."
                             sleep 5
                         done
 
-                        echo "Rollback health check failed."
+                        echo "Rolled-back application is not healthy."
                         exit 1
-                    '''
+                    """
+
+                    echo 'Application rollback completed successfully.'
+                    echo 'Database was NOT restored.'
                 }
             }
         }
     }
 
 
+    // =============================================================
+    // FINAL RESULT
+    // =============================================================
     post {
 
         always {
             script {
-
-                if (env.ROLLBACK_REQUIRED == 'true') {
+                /*
+                 * Jeżeli deployment wymagał rollbacku,
+                 * sam rollback może zakończyć się sukcesem,
+                 * ale deployment jako całość nadal był nieudany.
+                 */
+                if (rollbackRequired) {
                     currentBuild.result = 'FAILURE'
                 }
             }
