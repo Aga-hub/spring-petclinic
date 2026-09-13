@@ -5,6 +5,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 PROD_URL = "http://192.168.56.30:8080"
 
+options.add_argument("--window-size=1920,1080")
 options = webdriver.ChromeOptions()
 options.add_argument("--headless=new")
 options.add_argument("--no-sandbox")
@@ -20,13 +21,11 @@ try:
 
     find_owners = wait.until(
         EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, 'a[href$="/owners/find"]')
+            (By.LINK_TEXT, "Find Owners")
         )
     )
-
-    print("Found link:", find_owners.text)
-    print("Link target:", find_owners.get_attribute("href"))
-
+    
+    print("Clicking Find Owners")
     find_owners.click()
 
     wait.until(
