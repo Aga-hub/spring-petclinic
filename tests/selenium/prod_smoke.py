@@ -11,7 +11,6 @@ options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--window-size=1920,1080")
 
-
 driver = webdriver.Chrome(options=options)
 
 try:
@@ -20,19 +19,26 @@ try:
 
     wait = WebDriverWait(driver, 10)
 
+    # Find the "Find Owners" link using its target URL.
     find_owners = wait.until(
         EC.element_to_be_clickable(
-            (By.LINK_TEXT, "Find Owners")
+            (By.CSS_SELECTOR, 'a[href$="/owners/find"]')
         )
     )
-    
+
+    print("Found Find Owners link")
+    print("Target:", find_owners.get_attribute("href"))
+
+    # Actual browser interaction.
     print("Clicking Find Owners")
     find_owners.click()
 
+    # Verify that navigation occurred.
     wait.until(
         EC.url_contains("/owners/find")
     )
 
+    # Verify that the owner search form is visible.
     last_name = wait.until(
         EC.visibility_of_element_located(
             (By.NAME, "lastName")
@@ -45,9 +51,11 @@ try:
     print("Selenium PROD test PASSED")
 
 except Exception:
+    print("Selenium PROD test FAILED")
     print("FAILED on URL:", driver.current_url)
     print("Page title:", driver.title)
 
+    # Artifacts useful for debugging failed Jenkins builds.
     driver.save_screenshot("selenium-failure.png")
 
     with open("selenium-page.html", "w", encoding="utf-8") as f:
