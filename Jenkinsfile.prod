@@ -764,7 +764,7 @@ EOF
                         )
                     ]) {
 
-                        sh """
+                        sh '''
                             set +x
 
                             cat > /tmp/petclinic-prod.env <<EOF
@@ -820,7 +820,7 @@ EOF
 
                         echo "Rolled-back application is not healthy."
                         exit 1
-                    """
+                    '''
 
                     echo 'Application rollback completed successfully.'
                     echo 'Database was NOT restored.'
