@@ -1,5 +1,7 @@
 pipeline {
-    agent any
+    agent {
+        label 'default-agent'
+    }
 
     options {
         skipDefaultCheckout(true)
@@ -612,6 +614,35 @@ pipeline {
             }
         }
 
+        stage('Selenium E2E Test') {
+            agent {
+                label 'selenium-agent'
+            }
+        
+            steps {
+                checkout scm
+        
+                script {
+                    int seleniumStatus = sh(
+                        script: '''
+                            python tests/selenium/prod_smoke.py
+                        ''',
+                        returnStatus: true
+                    )
+        
+                    if (seleniumStatus != 0) {
+                        env.ROLLBACK_REQUIRED = 'true'
+        
+                        catchError(
+                            buildResult: 'SUCCESS',
+                            stageResult: 'FAILURE'
+                        ) {
+                            error('Selenium E2E test failed.')
+                        }
+                    }
+                }
+            }
+        }
 
         stage('Automatic Application Rollback') {
             when {
