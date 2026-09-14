@@ -42,18 +42,15 @@ pipeline {
 
     stages {
 
-        // =========================================================
-        // 1. VALIDATION
-        // =========================================================
         stage('Validate Parameters') {
             steps {
                 script {
                     if (!params.SOURCE_BUILD?.trim()) {
-                        error('SOURCE_BUILD nie może być pusty.')
+                        error('SOURCE_BUILD cannot be empty')
                     }
 
                     if (!(params.SOURCE_BUILD ==~ /^[0-9]+$/)) {
-                        error('SOURCE_BUILD musi być numerem builda CI.')
+                        error('SOURCE_BUILD needs to be CI build number')
                     }
 
                     echo "Selected CI build: ${params.SOURCE_BUILD}"
@@ -62,10 +59,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 2. RETRIEVE EXACT CI ARTIFACT
-        // =========================================================
         stage('Retrieve Artifact') {
             steps {
                 copyArtifacts(
@@ -82,10 +75,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 3. PRE-DEPLOYMENT CHECKS
-        // =========================================================
         stage('Pre-deployment Checks') {
             steps {
                 script {
@@ -131,10 +120,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 4. DATABASE BACKUP
-        // =========================================================
         stage('Backup Database') {
             steps {
                 withCredentials([
@@ -172,10 +157,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 5. OPTIONAL DATABASE MIGRATION
-        // =========================================================
         stage('Database Migration') {
 
             when {
@@ -238,10 +219,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 6. REMEMBER CURRENT VERSION
-        // =========================================================
         stage('Capture Current Version') {
             steps {
                 withCredentials([
@@ -276,10 +253,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 7. TRANSFER ARTIFACT
-        // =========================================================
         stage('Transfer Artifact') {
             steps {
                 withCredentials([
@@ -310,10 +283,6 @@ pipeline {
             }
         }
 
-
-        // =========================================================
-        // 8. DEPLOY APPLICATION
-        // =========================================================
         stage('Deploy Application') {
             steps {
                 script {
@@ -386,10 +355,6 @@ EOF
             }
         }
 
-
-        // =========================================================
-        // 9. CONTAINER STATUS
-        // =========================================================
         stage('Container Status Check') {
 
             when {
@@ -444,10 +409,6 @@ EOF
             }
         }
 
-
-        // =========================================================
-        // 10. HEALTH CHECK
-        // =========================================================
         stage('Health Check') {
 
             when {
@@ -499,10 +460,6 @@ EOF
             }
         }
 
-
-        // =========================================================
-        // 11. HTTP SMOKE TEST
-        // =========================================================
         stage('Smoke Test') {
 
             when {
@@ -548,10 +505,6 @@ EOF
             }
         }
 
-
-        // =========================================================
-        // 12. INITIAL LOG ANALYSIS
-        // =========================================================
         stage('Initial Log Analysis') {
 
             when {
@@ -607,7 +560,7 @@ EOF
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error('Critical errors detected in application logs.')
+                            error('Critical errors detected in application logs')
                         }
 
                     } else {
@@ -620,17 +573,13 @@ EOF
                         )
 
                         if (warningLogs == 0) {
-                            unstable('Warnings detected in initial production logs.')
+                            unstable('Warnings detected in initial production logs')
                         }
                     }
                 }
             }
         }
 
-
-        // =========================================================
-        // 13. STABILIZATION / SECOND CHECK
-        // =========================================================
         stage('Post-deployment Verification') {
 
             when {
@@ -664,17 +613,13 @@ EOF
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error('Post-deployment verification failed.')
+                            error('Post-deployment verification failed')
                         }
                     }
                 }
             }
         }
 
-
-        // =========================================================
-        // 14. SELENIUM E2E
-        // =========================================================
         stage('Selenium E2E Test') {
 
             when {
@@ -700,10 +645,6 @@ EOF
                         '''
                     )
 
-                    /*
-                     * prod_smoke.py zapisuje te pliki tylko w razie
-                     * niepowodzenia testu.
-                     */
                     archiveArtifacts(
                         artifacts: 'selenium-failure.png,selenium-page.html',
                         allowEmptyArchive: true
@@ -717,17 +658,13 @@ EOF
                             buildResult: 'SUCCESS',
                             stageResult: 'FAILURE'
                         ) {
-                            error('Selenium E2E test failed.')
+                            error('Selenium E2E test failed')
                         }
                     }
                 }
             }
         }
 
-
-        // =========================================================
-        // 15. AUTOMATIC APPLICATION ROLLBACK
-        // =========================================================
         stage('Automatic Application Rollback') {
 
             when {
@@ -745,7 +682,7 @@ EOF
 
                     if (!previousImage) {
                         error(
-                            'Rollback required, but no previous production image exists.'
+                            'Rollback required, but no previous production image exists'
                         )
                     }
 
@@ -810,38 +747,29 @@ EOF
                               "http://${PROD_APP_HOST}:8080/" \
                               >/dev/null
                             then
-                                echo "Rollback health check passed."
+                                echo "Rollback health check passed"
                                 exit 0
                             fi
 
-                            echo "Rollback health attempt $i/12 failed."
+                            echo "Rollback health attempt $i/12 failed"
                             sleep 5
                         done
 
-                        echo "Rolled-back application is not healthy."
+                        echo "Rolled-back application is not healthy"
                         exit 1
                     '''
 
-                    echo 'Application rollback completed successfully.'
-                    echo 'Database was NOT restored.'
+                    echo 'Application rollback completed successfully'
+                    echo 'Database was NOT restored'
                 }
             }
         }
     }
 
-
-    // =============================================================
-    // FINAL RESULT
-    // =============================================================
     post {
 
         always {
             script {
-                /*
-                 * Jeżeli deployment wymagał rollbacku,
-                 * sam rollback może zakończyć się sukcesem,
-                 * ale deployment jako całość nadal był nieudany.
-                 */
                 if (rollbackRequired) {
                     currentBuild.result = 'FAILURE'
                 }
@@ -849,15 +777,15 @@ EOF
         }
 
         success {
-            echo 'Production deployment successful.'
+            echo 'Production deployment successful'
         }
 
         unstable {
-            echo 'Production deployment completed with warnings.'
+            echo 'Production deployment completed with warnings'
         }
 
         failure {
-            echo 'Production deployment failed.'
+            echo 'Production deployment failed'
         }
 
         cleanup {
