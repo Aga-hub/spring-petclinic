@@ -179,7 +179,7 @@ pipeline {
                           'DROP[[:space:]]+TABLE|DROP[[:space:]]+COLUMN|TRUNCATE' \
                           "migration-${SOURCE_BUILD}.sql"
                         then
-                            echo "Destructive SQL detected."
+                            echo "Destructive SQL detected"
                             exit 1
                         fi
                     '''
