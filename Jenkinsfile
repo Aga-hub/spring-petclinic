@@ -4,8 +4,6 @@ pipeline {
     options {
         skipDefaultCheckout(true)
         buildDiscarder(logRotator(numToKeepStr: '10'))
-
-        // Te joby mogą pobierać artefakty z CI.
         copyArtifactPermission('deploy-production,rollback-production')
     }
 
@@ -24,13 +22,10 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                // Usuwa stare .tar i inne pozostałości poprzednich buildów.
                 deleteDir()
-
                 checkout scm
             }
         }
-
 
         stage('Build and Test') {
             steps {
