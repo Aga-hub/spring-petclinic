@@ -33,7 +33,7 @@ pipeline {
             steps {
                 script {
                     if (!(params.TARGET_BUILD ==~ /\d+/)) {
-                        error('TARGET_BUILD musi być numerem builda')
+                        error('TARGET_BUILD needs to be CI build number')
                     }
                 }
             }
@@ -163,7 +163,7 @@ pipeline {
                           http://${PROD_APP_HOST}:8080/ \
                           >/dev/null; then
 
-                            echo "Rollback version healthy."
+                            echo "Rollback version healthy"
                             exit 0
                         fi
 
